@@ -6,8 +6,11 @@
 #include <random>
 
 #include <arpa/inet.h>
-#include <string.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <unistd.h>
+#include <csignal>
+#include <cstring>
 
 
 using namespace std;
@@ -80,10 +83,8 @@ void createData ()
     }
 }
 
-void loadData (string pathFile)
+void loadData (const string pathFile)
 {
-    cout << "Loading data ..." << endl;
-
     ifstream ffile( pathFile );
     if (!pathFile.empty()){
         if (!ffile.is_open()) {
@@ -135,7 +136,45 @@ void loadData (string pathFile)
 
         data[event][avgtsmr] += 1;
     }
-    ffile.close();
+
+    if (!pathFile.empty())
+        ffile.close();
+}
+
+void loadDataFromFIFO(const string namePIPE)
+{
+    ifstream fifo( namePIPE );
+    if (fifo.is_open()){
+        string str;
+        string time;
+        string event;
+        string callcnt;
+        size_t avgtsmr;
+        getline(fifo, str);
+        getline(fifo, str);
+
+        while (f_run){
+            while (getline(fifo, str))
+            {
+                istringstream iss( str );
+                iss >> time >> event;
+                for (auto i {0}; i < 13; ++i) {
+                    iss >> callcnt;
+                }
+                iss >> avgtsmr;
+
+                data[event][avgtsmr] += 1;
+            }
+            if (fifo.eof())
+                fifo.clear();
+            else {
+                break;
+            }
+        }
+
+        fifo.close();
+    }
+    remove( namePIPE.c_str() );
 }
 
 auto getStatisticsEvent(string nameEvent)
@@ -200,34 +239,9 @@ void getFullStatistics()
     for (const auto &dataEvent: data){
         auto one_percent = getStatisticsEvent(dataEvent.first);
 
-        // output full map Statistics
-        // ==================================
-        if (0){
-            cout << "\nStatistics: " << endl;
-            auto percent = 0.0;
-            for (auto iter {dataEvent.second.cbegin()}; iter != dataEvent.second.cend(); ++iter){
-                auto weight = iter->second/one_percent;
-                percent += weight;
-                cout << iter->first << "\t" << iter->second << "\t" << weight << "\t" << percent << endl;
-            }
-        }
-
         cout << "ExecTime" << "\tTransNo" << "\tWeight" << "\tPercent" << endl;
         auto percent = 0.0;
         size_t cnt_trans {0};
-
-        /* сначала сделал так, но потом подумал
-         * так как у нас все-таки гистограмма, то переделал на вариант ниже
-        for (const auto &iter: dataEvent.second){
-            cnt_trans += iter.second;
-            if (iter.first % 5 == 0){
-                auto weight = trunc((cnt_trans/one_percent)*100)/100;
-                percent += weight;
-                cout << iter.first << "\t\t" << cnt_trans << "\t" << weight << "\t" << percent << endl;
-
-                cnt_trans = 0;
-            }
-        }*/
 
         auto &mpEvent = dataEvent.second;
         for (auto i {mpEvent.cbegin()->first}; i <= mpEvent.crbegin()->first; ++i) {
@@ -246,27 +260,39 @@ void getFullStatistics()
     }
 }
 
+void hdlSIGUSR1(int)
+{
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGUSR1);
+    sigprocmask(SIG_BLOCK, &set, nullptr);
+    getFullStatistics();
+    sigprocmask(SIG_UNBLOCK, &set, nullptr);
+}
+
 int main(int argc, char *argv[])
 {
     if (argc < 2) {
         cout << "Usage:" << endl;
-        cout << "\t./name_app -p [port] -i [file] -o [file]" << endl;
+        cout << "\t./name_app -p [port] -i [file] -o [file] -f [fifo]" << endl;
         cout << "\t-i [file] input file (logfile) | optional parametr" << endl;
         cout << "\t-o [file] output file          | optional parametr" << endl;
+        cout << "\t-f [fifo] named pipe           | optional parametr" << endl;
 
         return 0;
     }
 
-    char* opts = "p:i:o:";
+    string opts = "p:i:o:f:";
     uint16_t port {0};
     string ifile;
     string ofile;
+    string fifo;
 
     int opt;
-    while((opt = getopt(argc, argv, opts)) != -1) {
+    while((opt = getopt(argc, argv, opts.c_str())) != -1) {
         switch(opt) {
         case 'p':
-            port = atoi(optarg);
+            port = static_cast<uint16_t>(atoi(optarg));
             break;
         case 'i':
             ifile = optarg;
@@ -275,16 +301,42 @@ int main(int argc, char *argv[])
             ofile = optarg;
             freopen (optarg, "w", stdout);
             break;
+        case 'f':
+            fifo = optarg;
+            break;
         }
     }
 
-    if (ifile.empty()){
-        std::thread thrRecvData(loadData, ifile);
-        thrRecvData.detach();
-    }
-    else {
+
+    if (!ifile.empty()){
+        cout << "Loading data ..." << endl;
         loadData (ifile);
     }
+    else {
+        if (!fifo.empty()){
+            cout << "Creating FIFO: " << fifo << endl;
+            if (mkfifo(fifo.c_str(), 0777) == -1){
+                cerr << "mkfifo error";
+                return 0;
+            }
+            std::thread thrRecvData(loadDataFromFIFO, fifo);
+            thrRecvData.detach();
+        }
+        else {
+            std::thread thrRecvData(loadData, ifile);
+            thrRecvData.detach();
+        }
+    }
+
+
+
+    cout << "PID: " << getpid() << endl;
+    struct sigaction act;
+    memset(&act, 0, sizeof(act));
+    act.sa_handler = hdlSIGUSR1;
+    sigemptyset(&act.sa_mask);
+    sigaddset(&act.sa_mask, SIGUSR1);
+    sigaction(SIGUSR1, &act, nullptr);
 
 
     cout << "Server start ..." << endl;
@@ -311,6 +363,7 @@ int main(int argc, char *argv[])
         memset(buf, 0, sz_buf);
         recvfrom (fd_sock, buf, sz_buf, 0, nullptr, nullptr);
         string data (buf);
+        cout << "command: " << data << endl;
 
         if (data == "stop"){            // stop server
             f_run = false;
@@ -319,7 +372,7 @@ int main(int argc, char *argv[])
             if (!ifile.empty())
                 loadData (ifile);
 
-            if (data == "SIGUSR1") {
+            if (data == "STAT") {
                 getFullStatistics();
             }
             else {
